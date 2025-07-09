@@ -1,0 +1,144 @@
+# .gitlab-ci.yml
+
+stages:
+  - decrypt
+  - lint
+  - policy
+  - build
+  - sbom
+  - scan
+  - enforce
+  - patch
+  - rebuild
+  - jmeter
+  - sign
+  - push
+
+variables:
+  DOCKER_TLS_CERTDIR: ""                     # disable Docker's new certdir
+  IMAGE_NAME: "${CI_REGISTRY_IMAGE}"         # e.g. registry.gitlab.com/your/project
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
+  FULL_IMAGE: "${IMAGE_NAME}:${IMAGE_TAG}"
+  LOGSTASH_VERSION: "9.0.3"                  # override in CI/CD → Variables as needed
+
+# Use Docker-in-Docker for build, sign, push
+image: docker:20.10.16
+services:
+  - docker:20.10.16-dind
+
+# 1. Decrypt your age-encrypted secrets
+decrypt_secrets:
+  stage: decrypt
+  image: filippo/age:1.0.0
+  script:
+    - echo "$AGE_KEY" > agekey.txt
+    - age --decrypt secrets.enc --identity agekey.txt > secrets.yaml
+  artifacts:
+    paths:
+      - secrets.yaml
+    expire_in: 1h
+
+# 2. Lint your Containerfile
+lint_dockerfile:
+  stage: lint
+  image: hadolint/hadolint:latest
+  script:
+    - hadolint Containerfile
+
+# 3. Enforce policy on your Containerfile (OPA/Conftest)
+policy_enforcement:
+  stage: policy
+  image: instrumenta/conftest:latest
+  script:
+    - conftest test Containerfile policies/
+
+# 4. Build your image with the specified Logstash version
+build_image:
+  stage: build
+  script:
+    - docker build \
+        --build-arg LOGSTASH_VERSION=${LOGSTASH_VERSION} \
+        -f Containerfile \
+        -t ${FULL_IMAGE} \
+        .
+
+# 5. Generate SBOM (CycloneDX via Syft)
+generate_sbom:
+  stage: sbom
+  image: anchore/syft:latest
+  script:
+    - syft ${FULL_IMAGE} -o cyclonedx-json=sbom.json
+  artifacts:
+    paths:
+      - sbom.json
+
+# 6. Scan for vulnerabilities (Trivy)
+scan_image:
+  stage: scan
+  image: aquasec/trivy:latest
+  script:
+    - trivy image --exit-code 0 --format json --output trivy-report.json ${FULL_IMAGE}
+  artifacts:
+    paths:
+      - trivy-report.json
+
+# 7. Enforce no CRITICAL vulnerabilities
+enforce_vuln_policy:
+  stage: enforce
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache jq
+  script:
+    - |
+      CRIT=$(jq '[.Results[].Vulnerabilities[] | select(.Severity=="CRITICAL")] | length' trivy-report.json)
+      if [ "$CRIT" -gt 0 ]; then
+        echo "❌ $CRIT critical vulnerabilities found"; exit 1
+      fi
+
+# 8. Patch stage (placeholder—version is driven by LOGSTASH_VERSION)
+patch_image:
+  stage: patch
+  script:
+    - echo "🔧 Patch stage: no-op (LOGSTASH_VERSION controls base image tag)"
+
+# 9. Rebuild (to pick up any changes from patch stage)
+rebuild_image:
+  stage: rebuild
+  script:
+    - docker build \
+        --build-arg LOGSTASH_VERSION=${LOGSTASH_VERSION} \
+        -f Containerfile \
+        -t ${FULL_IMAGE} \
+        .
+
+# 10. Performance testing with JMeter
+performance_test:
+  stage: jmeter
+  image: justb4/jmeter:5.4.1
+  script:
+    - jmeter -n -t tests/pipeline_test_plan.jmx -l results.jtl
+  artifacts:
+    when: always
+    paths:
+      - results.jtl
+
+# 11. Sign & verify with Cosign (offline)
+sign_image:
+  stage: sign
+  before_script:
+    - apk add --no-cache curl openssl
+    - curl -Lo cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+    - chmod +x cosign
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+  script:
+    - echo "$COSIGN_PASSWORD" | ./cosign generate-key-pair --passphrase-stdin cosign.key cosign.pub
+    - ./cosign sign --key cosign.key ${FULL_IMAGE}
+    - ./cosign verify --key cosign.pub ${FULL_IMAGE}
+
+# 12. Push to your GitLab registry
+push_image:
+  stage: push
+  script:
+    - docker push ${FULL_IMAGE}
+  needs:
+    - sign_image

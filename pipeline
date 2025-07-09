@@ -1,5 +1,3 @@
-# .gitlab-ci.yml
-
 stages:
   - decrypt
   - lint
@@ -15,18 +13,16 @@ stages:
   - push
 
 variables:
-  DOCKER_TLS_CERTDIR: ""                     # disable Docker's new certdir
-  IMAGE_NAME: "${CI_REGISTRY_IMAGE}"         # e.g. registry.gitlab.com/your/project
+  DOCKER_TLS_CERTDIR: ""
+  IMAGE_NAME: "${CI_REGISTRY_IMAGE}"
   IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
   FULL_IMAGE: "${IMAGE_NAME}:${IMAGE_TAG}"
-  LOGSTASH_VERSION: "9.0.3"                  # override in CI/CD → Variables as needed
+  LOGSTASH_VERSION: "9.0.3"        # override in CI/CD → Variables as needed
 
-# Use Docker-in-Docker for build, sign, push
 image: docker:20.10.16
 services:
   - docker:20.10.16-dind
 
-# 1. Decrypt your age-encrypted secrets
 decrypt_secrets:
   stage: decrypt
   image: filippo/age:1.0.0
@@ -38,21 +34,18 @@ decrypt_secrets:
       - secrets.yaml
     expire_in: 1h
 
-# 2. Lint your Containerfile
 lint_dockerfile:
   stage: lint
   image: hadolint/hadolint:latest
   script:
     - hadolint Containerfile
 
-# 3. Enforce policy on your Containerfile (OPA/Conftest)
 policy_enforcement:
   stage: policy
   image: instrumenta/conftest:latest
   script:
     - conftest test Containerfile policies/
 
-# 4. Build your image with the specified Logstash version
 build_image:
   stage: build
   script:
@@ -62,7 +55,6 @@ build_image:
         -t ${FULL_IMAGE} \
         .
 
-# 5. Generate SBOM (CycloneDX via Syft)
 generate_sbom:
   stage: sbom
   image: anchore/syft:latest
@@ -72,7 +64,6 @@ generate_sbom:
     paths:
       - sbom.json
 
-# 6. Scan for vulnerabilities (Trivy)
 scan_image:
   stage: scan
   image: aquasec/trivy:latest
@@ -82,7 +73,6 @@ scan_image:
     paths:
       - trivy-report.json
 
-# 7. Enforce no CRITICAL vulnerabilities
 enforce_vuln_policy:
   stage: enforce
   image: alpine:latest
@@ -95,13 +85,17 @@ enforce_vuln_policy:
         echo "❌ $CRIT critical vulnerabilities found"; exit 1
       fi
 
-# 8. Patch stage (placeholder—version is driven by LOGSTASH_VERSION)
 patch_image:
   stage: patch
-  script:
-    - echo "🔧 Patch stage: no-op (LOGSTASH_VERSION controls base image tag)"
+  # Either of these two formats will work—pick one:
 
-# 9. Rebuild (to pick up any changes from patch stage)
+  # Single-line string:
+  script: echo "🔧 Patch stage: no-op (LOGSTASH_VERSION controls base image tag)"
+
+  # Or, as a list of one string:
+  #script:
+  #  - echo "🔧 Patch stage: no-op (LOGSTASH_VERSION controls base image tag)"
+
 rebuild_image:
   stage: rebuild
   script:
@@ -111,7 +105,6 @@ rebuild_image:
         -t ${FULL_IMAGE} \
         .
 
-# 10. Performance testing with JMeter
 performance_test:
   stage: jmeter
   image: justb4/jmeter:5.4.1
@@ -122,7 +115,6 @@ performance_test:
     paths:
       - results.jtl
 
-# 11. Sign & verify with Cosign (offline)
 sign_image:
   stage: sign
   before_script:
@@ -135,7 +127,6 @@ sign_image:
     - ./cosign sign --key cosign.key ${FULL_IMAGE}
     - ./cosign verify --key cosign.pub ${FULL_IMAGE}
 
-# 12. Push to your GitLab registry
 push_image:
   stage: push
   script:
